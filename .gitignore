@@ -1,0 +1,7 @@
+.env.webhook
+.env
+.env.*
+!.env.webhook.example
+*.zip
+*.tar.gz
+test-results/

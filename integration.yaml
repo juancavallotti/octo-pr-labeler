@@ -1,0 +1,181 @@
+service:
+  name: Octo PR Auto Labeler
+env:
+  - name: HTTP_PORT
+    default: "8080"
+  - name: GITHUB_TOKEN
+  - name: GITHUB_API_VERSION_PREFIX
+    default: "2022-11"
+  - name: GITHUB_WEBHOOK_PATH
+  - name: GITHUB_WEBHOOK_SECRET
+resources:
+  env:
+    - .env.webhook
+connectors:
+  - name: webhook
+    type: http
+    settings:
+      port: ${HTTP_PORT}
+      keepAlive: true
+      requestTimeout: 25s
+  - name: github
+    type: http-client
+    settings:
+      baseURL: https://api.github.com
+      timeout: 20s
+      headers:
+        Accept: application/vnd.github+json
+        X-GitHub-Api-Version: ${GITHUB_API_VERSION_PREFIX}-28
+        User-Agent: octo-pr-auto-labeler
+      auth:
+        type: bearer
+        token: ${GITHUB_TOKEN}
+      retry:
+        maxAttempts: 3
+        maxBackoff: 10s
+flows:
+  - name: github-pull-request
+    source:
+      connector: webhook
+      type: http
+      settings:
+        path: /github/${GITHUB_WEBHOOK_PATH}
+        headers:
+          - X-GitHub-Event
+          - X-GitHub-Delivery
+          - X-Hub-Signature-256
+        correlationIdHeader: X-GitHub-Delivery
+        rawBody: true
+        maxBodyBytes: 2097152
+        timeout: 25s
+    process:
+      - type: validate
+        name: verify-github-signature
+        rules:
+          - expr: >
+              "X-Hub-Signature-256" in vars && secureCompare(
+                vars["X-Hub-Signature-256"],
+                "sha256=" + hexEncode(hmacSha256(env.GITHUB_WEBHOOK_SECRET, body.rawData))
+              )
+            message: invalid GitHub webhook signature
+        rejectStatus: 401
+      - type: set-payload
+        name: parse-webhook-json
+        settings:
+          value: fromJson(body.rawData)
+      - type: if
+        name: supported-pr-event
+        condition: >
+          vars["X-GitHub-Event"] == "pull_request" && body.action in ["opened",
+          "reopened", "synchronize", "ready_for_review"]
+        then:
+          process:
+            - type: validate
+              name: validate-octo-repository
+              rules:
+                - expr: has(body.repository.full_name) && body.repository.full_name ==
+                    "juancavallotti/octo"
+                  message: webhook repository is not juancavallotti/octo
+                - expr: has(body.pull_request.number) && has(body.pull_request.changed_files)
+                  message: pull request payload is incomplete
+              rejectStatus: 403
+            - type: multi-transform
+              name: capture-pull-request
+              settings:
+                transforms:
+                  - setVar: prNumber
+                    value: body.pull_request.number
+                  - setVar: changedFiles
+                    value: body.pull_request.changed_files
+                  - setVar: action
+                    value: body.action
+                  - setBody: "lists.range(int(((vars.changedFiles < 3000.0 ? vars.changedFiles :
+                      3000.0) + 99.0) / 100.0))"
+            - type: foreach
+              name: fetch-file-pages
+              items: body
+              as: pageIndex
+              mode: map
+              body:
+                process:
+                  - type: rest-dynamic
+                    name: fetch-files
+                    settings:
+                      connector: github
+                      method: '"GET"'
+                      path: '"/repos/juancavallotti/octo/pulls/" + string(vars.prNumber) + "/files"'
+                      query: '{"per_page": "100", "page": string(int(vars.pageIndex) + 1)}'
+                      allowMethods:
+                        - GET
+                      pathPrefix: /repos/juancavallotti/octo/pulls/
+                      failOnError: true
+                      statusVar: githubStatus
+            - type: set-variable
+              name: classify-files
+              settings:
+                name: labels
+                value: >
+                  (body.flatten().exists(f,
+                  f.filename.lowerAscii().endsWith(".go")) ? ["backend"] : []) +
+                  (body.flatten().exists(f,
+                    f.filename.lowerAscii().endsWith(".ts") ||
+                    f.filename.lowerAscii().endsWith(".tsx") ||
+                    f.filename.lowerAscii().endsWith(".js") ||
+                    f.filename.lowerAscii().endsWith(".jsx") ||
+                    f.filename.lowerAscii().endsWith(".mjs") ||
+                    f.filename.lowerAscii().endsWith(".cjs") ||
+                    f.filename.lowerAscii().endsWith(".css") ||
+                    f.filename.lowerAscii().endsWith(".scss") ||
+                    f.filename.lowerAscii().endsWith(".sass") ||
+                    f.filename.lowerAscii().endsWith(".less") ||
+                    f.filename.lowerAscii().endsWith(".vue") ||
+                    f.filename.lowerAscii().endsWith(".svelte") ||
+                    f.filename.lowerAscii().endsWith("package.json") ||
+                    f.filename.lowerAscii().endsWith("vite.config.ts") ||
+                    f.filename.lowerAscii().endsWith("vite.config.js")
+                  ) ? ["front-end"] : []) +
+                  body.flatten().map(f,
+                  f.filename.startsWith("orchestrator/") ? "module: orchestrator" :
+                  f.filename.startsWith("logs/") ? "module: logs" :
+                  f.filename.startsWith("sidecars/") ? "module: sidecars" :
+                  f.filename.startsWith("apps/platform/") ? "module: platform" :
+                  f.filename.startsWith("apps/standalone/") ? "module: standalone" :
+                  f.filename.startsWith("apps/docs/") ? "module: docs" :
+                  f.filename.startsWith("packages/editor/") ? "module: editor" :
+                  f.filename.startsWith("packages/events/") ? "module: events" :
+                  f.filename.startsWith("packages/http/") ? "module: http" :
+                  f.filename.startsWith("packages/mcp/") ? "module: mcp" :
+                  f.filename.startsWith("packages/run-host/") ? "module: run-host" :
+                  f.filename.startsWith("runtime/") || f.filename.startsWith("samples/") || f.filename == "go.mod" || f.filename == "go.sum" ? "module: octo" :
+                  ""
+                  ).filter(label, label != "").distinct()
+            - type: if
+              name: labels-found
+              condition: vars.labels.size() > 0
+              then:
+                process:
+                  - type: rest-dynamic
+                    name: apply-labels
+                    settings:
+                      connector: github
+                      method: '"POST"'
+                      path: '"/repos/juancavallotti/octo/issues/" + string(vars.prNumber) + "/labels"'
+                      body: '{"labels": vars.labels}'
+                      allowMethods:
+                        - POST
+                      pathPrefix: /repos/juancavallotti/octo/issues/
+                      failOnError: true
+                      statusVar: githubStatus
+            - type: set-payload
+              name: accepted-response
+              settings:
+                value: '{"ok": true, "pullRequest": vars.prNumber, "labels": vars.labels,
+                  "action": vars.action}'
+        else:
+          process:
+            - type: set-payload
+              name: ignored-response
+              settings:
+                value: '{"ok": true, "ignored": true}'
+    workers: 8
+    buffer: 128

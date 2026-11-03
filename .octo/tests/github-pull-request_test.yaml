@@ -1,0 +1,252 @@
+flow: github-pull-request
+env:
+  GITHUB_TOKEN: test-token
+  GITHUB_WEBHOOK_PATH: test-hook
+  GITHUB_WEBHOOK_SECRET: test-secret
+cases:
+  - name: valid signature with Go and React files applies category and module labels
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"opened","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":42,"changed_files":2}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: delivery-1
+        X-Hub-Signature-256: sha256=a49e8b0bf1d56cdf1920cdced942ce1c24d697442ec5342eb49ce485c4419c20
+    mocks:
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        default:
+          body:
+            - filename: runtime/main.go
+            - filename: packages/editor/src/App.tsx
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        default:
+          body:
+            - name: backend
+            - name: front-end
+            - name: "module: octo"
+            - name: "module: editor"
+    expect:
+      body:
+        ok: true
+        pullRequest: 42
+        labels:
+          - backend
+          - front-end
+          - "module: octo"
+          - "module: editor"
+        action: opened
+    spies:
+      github-pull-request.parse-webhook-json:
+        count: 1
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        count: 1
+        records:
+          - input:
+              vars:
+                labels:
+                  - backend
+                  - front-end
+                  - "module: octo"
+                  - "module: editor"
+  - name: valid signature detects a relevant file on a later page
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"synchronize","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":77,"changed_files":101}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: delivery-2
+        X-Hub-Signature-256: sha256=4d26efa397677ee8e796e31d64803c2e829ca5a7719c2232fba2f2619a2bd924
+    mocks:
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        cases:
+          - when: vars.pageIndex == 0
+            body:
+              - filename: docs/architecture.md
+          - when: vars.pageIndex == 1
+            body:
+              - filename: web/components/Button.jsx
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        default:
+          body: []
+    expect:
+      body:
+        ok: true
+        pullRequest: 77
+        labels:
+          - front-end
+        action: synchronize
+    spies:
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        count: 2
+  - name: valid signature with unrelated files does not call labels API
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"reopened","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":9,"changed_files":2}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: delivery-3
+        X-Hub-Signature-256: sha256=76d2b03103dcca8843ab590ebcfd3e712f977f68df0d7b42e793f6b3ca892215
+    mocks:
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        default:
+          body:
+            - filename: README.md
+            - filename: docs/design.txt
+    expect:
+      body:
+        ok: true
+        pullRequest: 9
+        labels: []
+        action: reopened
+    spies:
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        count: 0
+  - name: valid signature on label event is ignored to prevent recursion
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"labeled","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":42,"changed_files":2}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: delivery-4
+        X-Hub-Signature-256: sha256=1eeeae1b86532e9b3b52d05b48f1867f946285c819e656a64351218d6d5abbfb
+    expect:
+      body:
+        ok: true
+        ignored: true
+    spies:
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        count: 0
+  - name: missing signature is rejected before parsing
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"opened","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":42,"changed_files":2}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: negative-1
+    expect:
+      body:
+        error: validation_failed
+        messages:
+          - invalid GitHub webhook signature
+      vars:
+        httpStatus: 401
+    spies:
+      github-pull-request.parse-webhook-json:
+        count: 0
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        count: 0
+  - name: forged signature is rejected before parsing
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"opened","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":42,"changed_files":2}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: negative-2
+        X-Hub-Signature-256: sha256=deadbeef
+    expect:
+      body:
+        error: validation_failed
+        messages:
+          - invalid GitHub webhook signature
+      vars:
+        httpStatus: 401
+    spies:
+      github-pull-request.parse-webhook-json:
+        count: 0
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        count: 0
+  - name: labels each changed module once across files
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"synchronize","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":101,"changed_files":6}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: delivery-101
+        X-Hub-Signature-256: sha256=d88e694cf087463da7346f0abd1bb466f32347d95c29223511de4bd841c93e9a
+    mocks:
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        default:
+          body:
+            - filename: runtime/core/main.go
+            - filename: orchestrator/main.go
+            - filename: orchestrator/extra.go
+            - filename: apps/platform/app/page.tsx
+            - filename: packages/mcp/src/tools.ts
+            - filename: packages/http/src/client.ts
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        default:
+          body:
+            - name: backend
+            - name: front-end
+            - name: "module: octo"
+            - name: "module: orchestrator"
+            - name: "module: platform"
+            - name: "module: mcp"
+            - name: "module: http"
+    expect:
+      body:
+        ok: true
+        pullRequest: 101
+        labels:
+          - backend
+          - front-end
+          - "module: octo"
+          - "module: orchestrator"
+          - "module: platform"
+          - "module: mcp"
+          - "module: http"
+        action: synchronize
+    spies:
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        count: 1
+        records:
+          - input:
+              vars:
+                labels:
+                  - backend
+                  - front-end
+                  - "module: octo"
+                  - "module: orchestrator"
+                  - "module: platform"
+                  - "module: mcp"
+                  - "module: http"
+  - name: adds a module label for docs-only changes
+    input:
+      data:
+        contentType: application/json
+        rawData: '{"action":"opened","repository":{"full_name":"juancavallotti/octo"},"pull_request":{"number":102,"changed_files":1}}'
+      vars:
+        X-GitHub-Event: pull_request
+        X-GitHub-Delivery: delivery-102
+        X-Hub-Signature-256: sha256=2fc2d7e8f2ba0ea5c391158b8444136390dba196e514baab9102bec99e96e644
+    mocks:
+      github-pull-request.supported-pr-event[then].fetch-file-pages[body].fetch-files:
+        default:
+          body:
+            - filename: apps/docs/content/docs/testing/index.mdx
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        default:
+          body:
+            - name: "module: docs"
+    expect:
+      body:
+        ok: true
+        pullRequest: 102
+        labels:
+          - "module: docs"
+        action: opened
+    spies:
+      github-pull-request.supported-pr-event[then].labels-found[then].apply-labels:
+        count: 1
+        records:
+          - input:
+              vars:
+                labels:
+                  - "module: docs"

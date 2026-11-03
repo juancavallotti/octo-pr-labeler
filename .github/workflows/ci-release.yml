@@ -1,0 +1,91 @@
+name: Test, release, and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to test and roll out again
+        required: true
+        type: string
+
+jobs:
+  test:
+    name: Dolphin tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.sha }}
+      - name: Install pinned Octo tools
+        run: |
+          ./scripts/install-ci-tools.sh "$RUNNER_TEMP/octo-bin"
+          echo "$RUNNER_TEMP/octo-bin" >> "$GITHUB_PATH"
+      - name: Run Dolphin
+        env:
+          OCTO_PATH: ${{ runner.temp }}/octo-bin/octo
+        run: |
+          cp .env.webhook.example .env.webhook
+          mkdir -p test-results
+          dolphin test --config integration.yaml \
+            .octo/tests/github-pull-request_test.yaml \
+            --junit test-results/dolphin.xml
+      - name: Publish test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dolphin-report
+          path: test-results/dolphin.xml
+          if-no-files-found: ignore
+
+  release:
+    name: Release Please
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - id: release
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  deploy:
+    name: Roll out release
+    needs: [test, release]
+    if: >-
+      always() && needs.test.result == 'success' &&
+      (github.event_name == 'workflow_dispatch' || needs.release.outputs.release_created == 'true')
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: octo-pr-labeler-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || needs.release.outputs.tag_name }}
+      - name: Install pinned Octo tools
+        run: |
+          ./scripts/install-ci-tools.sh "$RUNNER_TEMP/octo-bin"
+          echo "$RUNNER_TEMP/octo-bin" >> "$GITHUB_PATH"
+      - name: Update integration and roll out version
+        env:
+          OCTOPAAS_URL: https://api.octopaas.dev
+          OCTOPAAS_KEY: ${{ secrets.OCTOPAAS_KEY }}
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || needs.release.outputs.tag_name }}
+        run: ./scripts/deploy.sh "$RELEASE_TAG"
