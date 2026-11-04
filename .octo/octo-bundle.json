@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "name": "Octo PR Auto Labeler",
+  "configs": ["integration.yaml"],
+  "resources": [
+    { "name": ".octo/tests/github-pull-request_test.yaml", "kind": "template" }
+  ]
+}
