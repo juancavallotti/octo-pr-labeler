@@ -2,7 +2,7 @@
 
 This repository is the source for the [Octo PR Auto Labeler integration](https://octopaas.dev/platform/i/8ec66cf4-e38b-45fe-b9c8-fb43eb865bae). It verifies GitHub pull request webhooks, reads changed files, and adds `backend`, `front-end`, and `module: name` labels to pull requests in `juancavallotti/octo`.
 
-The integration definition was pulled with `octopaas`. The repo tracks the definition and its Dolphin suite. The platform's `.env.webhook` resource contains live credentials and is deliberately absent from Git.
+The integration definition was pulled with `octopaas`. The repo tracks the definition, its Dolphin suite and the bundle manifest that lists them. The deployment gets its GitHub credentials from its own env bindings (cluster secrets), so no credentials live in Git or in the integration's files.
 
 ## Files
 
@@ -10,9 +10,10 @@ The integration definition was pulled with `octopaas`. The repo tracks the defin
 | --- | --- |
 | `integration.yaml` | The integration's runtime definition |
 | `.octo/tests/github-pull-request_test.yaml` | Dolphin cases, including webhook signatures, pagination, module labels, and rejected signatures |
+| `.octo/octo-bundle.json` | The bundle manifest: lists the suite so `octopaas integrations push` sends it, since push skips hidden files the manifest does not name |
 | `.env.webhook.example` | Synthetic values for local and CI tests |
 | `.github/workflows/ci-release.yml` | PR tests, Release Please, and rollout |
-| `scripts/deploy.sh` | Upload the tracked files, create the Release Please version, and roll out the existing deployment |
+| `scripts/deploy.sh` | Push the checkout, create the Release Please version, and roll out the existing deployment |
 | `scripts/platform-version.sh` | Normalize a Release Please version or component tag to the platform's `vX.Y.Z` tag |
 | `scripts/test-platform-version.sh` | Regression checks for automatic and manually retried release versions |
 
@@ -39,22 +40,22 @@ cp "$scratch/.octo/tests/github-pull-request_test.yaml" .octo/tests/
 dolphin test --config integration.yaml .octo/tests/github-pull-request_test.yaml
 ```
 
-Inspect the diff before committing. Keep `$scratch/.env.webhook` and the bundle manifest out of this repository. Delete the temporary directory when done.
+Inspect the diff before committing. Keep the tracked `.octo/octo-bundle.json` rather than the pulled one, and add any new file CI should push to its `resources`. Delete the temporary directory when done.
 
 ## CI and release flow
 
 1. A pull request runs the Dolphin suite on GitHub Actions.
 2. A push to `main` runs the suite again. If it passes, [Release Please](https://github.com/googleapis/release-please-action) opens or updates a release PR from Conventional Commits such as `fix: ...` and `feat: ...`.
 3. Merging the release PR triggers another `main` run. After tests pass, Release Please creates a GitHub release and a component-qualified `octo-pr-labeler-vX.Y.Z` Git tag.
-4. The deploy job checks out that Git tag, updates `integration.yaml` and the Dolphin suite on Octo, creates the matching `vX.Y.Z` Octo version, and rolls out the existing deployment. For example, Release Please's `octo-pr-labeler-v1.1.0` Git tag becomes platform version `v1.1.0`. It waits for the rollout result.
+4. The deploy job checks out that Git tag, pushes it to Octo with `octopaas integrations push`, creates the matching `vX.Y.Z` Octo version, and rolls out the existing deployment. For example, Release Please's `octo-pr-labeler-v1.1.0` Git tag becomes platform version `v1.1.0`. It waits for the rollout result.
 
-The deploy script updates the two tracked files individually. It preserves the platform's `.env.webhook` resource and the deployment's existing secret bindings. It also reuses an existing Octo version when rerunning the same release tag.
+A push replaces the integration's whole contents with the checkout: `integration.yaml`, the suite, and nothing else. A file that exists only on the platform is removed. The rollout keeps the deployment's env bindings, which is where `GITHUB_TOKEN`, `GITHUB_WEBHOOK_SECRET` and `GITHUB_WEBHOOK_PATH` come from. The script reuses an existing Octo version when rerunning the same release tag.
 
 To retry a released version, run **Test, release, and deploy** from the Actions tab with **Run workflow** and enter an existing `release_tag`. The workflow tests that tag before rolling it out.
 
 ## One-time GitHub setup
 
-- Add an `OCTOPAAS_KEY` Actions secret to the `production` environment (or at repository level). Mint an Octo API key for an account with the `platform:operator` (or `platform:admin`) role, which is required to edit the integration, create versions, and roll out its deployment. The workflow uses `https://api.octopaas.dev` as `OCTOPAAS_URL` and checks the role before changing anything.
+- Add an `OCTOPAAS_KEY` Actions secret to the `production` environment (or at repository level). Mint an Octo API key with the **CI/CD** (`platform:cicd`) role: it can push the integration, create versions and roll out the existing deployment, and nothing else. The workflow uses `https://api.octopaas.dev` as `OCTOPAAS_URL`.
 - Allow GitHub Actions to create pull requests in **Settings → Actions → General**, so Release Please can open its release PR.
 - Optionally add a `RELEASE_PLEASE_TOKEN` secret containing a GitHub App token or PAT with repository content and pull request write access. Without it, Release Please uses `GITHUB_TOKEN`; GitHub does not start separate CI runs for PRs created by that token. The merge into `main` still runs Dolphin before any release or rollout.
 - If desired, protect the `production` environment with required reviewers. That holds the rollout until it is approved.
